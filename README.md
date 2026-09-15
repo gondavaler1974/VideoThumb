@@ -1,4 +1,4 @@
-# VideoThumb v1.4.3
+# VideoThumb v1.4.4
 
 Fast 64-bit video thumbnail plugin for Total Commander.
 
@@ -9,7 +9,7 @@ whose target is an SMB/UNC network share.
 Conceptually:
 
 Local directory symlink
-        ↓
+↓
 SMB / UNC network share
 
 Windows Explorer and standard Total Commander thumbnail providers may fail to generate
@@ -19,6 +19,13 @@ UNC path is opened directly.
 VideoThumb bypasses the Windows Shell thumbnail path and decodes thumbnails directly
 with FFmpeg libraries.
 
+## What's new in v1.4.4
+
+- Added FFmpeg-based in-memory image decoding fallback for ZIP image sequences
+- HEIC / HEIF images inside ZIP-disguised video files no longer require Windows codecs
+- HEIC / HEIF decoding is performed directly from memory without temporary files
+- WIC remains the primary decoder for common image formats, with FFmpeg as fallback
+- Improved ZIP image decoding portability and self-contained deployment
 
 ## Features
 
@@ -32,6 +39,9 @@ with FFmpeg libraries.
 - ZIP image-sequence support
   - A file may have an .mp4 extension but actually contain a ZIP archive of images
   - VideoThumb can use the naturally first decodable image as its thumbnail
+  - HEIC / HEIF images are decoded directly from memory through FFmpeg
+  - No Windows HEIC / HEIF codec or HEIF Image Extensions package is required
+  - Other image formats normally use Windows Imaging Component (WIC), with FFmpeg as a fallback
 - Smart thumbnail selection
   - rejects black frames
   - rejects white or nearly uniform frames
@@ -41,7 +51,6 @@ with FFmpeg libraries.
   - tries later positions automatically and selects a better candidate
 - Total Commander can additionally store the generated thumbnails in its own persistent
   thumbnail database
-
 
 ## Supported video formats
 
@@ -59,7 +68,6 @@ VideoThumb uses FFmpeg, so common formats such as the following are supported:
 
 Actual codec/container support depends on the FFmpeg build used with the plugin.
 
-
 ## Installation
 
 Copy the release contents to a directory such as:
@@ -71,11 +79,11 @@ The directory should contain:
 VideoThumb.wlx64
 VideoThumb.ini
 
-avcodec-*.dll
-avformat-*.dll
-avutil-*.dll
-swscale-*.dll
-swresample-*.dll
+avcodec-_.dll
+avformat-_.dll
+avutil-_.dll
+swscale-_.dll
+swresample-\*.dll
 
 Then in Total Commander:
 
@@ -96,7 +104,6 @@ Configuration
 → Thumbnails
 
 Make sure the required video extensions are enabled for Lister-plugin thumbnail generation.
-
 
 ## Configuration
 
@@ -149,114 +156,109 @@ ResolveSymlinkFallback=0
 The default settings are intentionally conservative and are suitable for older CPUs and
 SMB/network storage.
 
-
 ## Configuration reference
 
 ### [Performance]
 
-CacheMB
+CacheMB\
 Maximum size of VideoThumb's in-memory LRU thumbnail cache, in megabytes.
 
-CacheEntries
+CacheEntries\
 Maximum number of cached thumbnail entries.
 
-MaxParallel
+MaxParallel\
 Maximum number of thumbnails that may be decoded concurrently.
 
-DecoderThreads
+DecoderThreads\
 Maximum number of decoder threads used per FFmpeg decoder context.
 
-TimeoutMs
+TimeoutMs\
 Maximum time allowed for libav/FFmpeg I/O before the operation is aborted.
 
-PacketLimit
+PacketLimit\
 Safety limit on the number of media packets processed while looking for a usable frame.
-
 
 ### [Thumbnail]
 
-SeekMs
-Initial seek position used for selecting a representative video frame.
+SeekMs\
+Initial seek position used for selecting a representative video frame.\
 1000 means 1 second.
 
-BlackFrameDetection
+BlackFrameDetection\
 Enables detection of nearly black frames.
 
-BlackThreshold
+BlackThreshold\
 Luma threshold below which a sampled pixel is considered black.
 
-BlackPixelPercent
+BlackPixelPercent\
 Percentage of black pixels required before a frame is classified as a black frame.
 
-TitleCardDetection
+TitleCardDetection\
 Enables detection of title-card-like frames.
 
-TitleCardDarkPercent
+TitleCardDarkPercent\
 Percentage of dark pixels used by title-card detection.
 
-TitleCardMidtoneMaxPercent
+TitleCardMidtoneMaxPercent\
 Maximum percentage of midtone pixels allowed for title-card classification.
 
-TitleCardMeanLumaMax
+TitleCardMeanLumaMax\
 Maximum average luma for title-card classification.
 
-UniformFrameDetection
+UniformFrameDetection\
 Enables detection of nearly uniform frames of any color.
 
-MaxLumaStdDev
+MaxLumaStdDev\
 Maximum luma standard deviation for a frame to be considered too uniform.
 
-MaxColorStdDev
+MaxColorStdDev\
 Maximum color-channel standard deviation for a frame to be considered too uniform.
 
-DominantColorPercent
+DominantColorPercent\
 Percentage threshold for determining whether one color dominates the frame.
 
-TransitionDetection
+TransitionDetection\
 Enables detection of low-detail fade and transition frames.
 
-MinEdgePercent
+MinEdgePercent\
 Minimum percentage of sampled pixels that must contain meaningful edges.
 
-EdgeThreshold
+EdgeThreshold\
 Threshold used when detecting image edges.
 
-MaxMeanGradient
+MaxMeanGradient\
 Maximum mean image gradient for a frame to be considered a low-detail transition.
 
-FallbackSeekMs
+FallbackSeekMs\
 Comma-separated list of additional seek positions in milliseconds.
 
-FallbackPercent
+FallbackPercent\
 Additional seek position expressed as a percentage of total video duration.
-
 
 ### [ZipSequence]
 
-Enabled
+Enabled\
 Enables support for image sequences stored inside ZIP archives, even when the file uses
 a video-like extension such as .mp4.
 
-MaxEntryMB
+MaxEntryMB\
 Maximum uncompressed size of a candidate image entry inside the ZIP archive.
 
-MaxCandidates
+MaxCandidates\
 Maximum number of candidate images inspected inside the archive.
 
-MaxSourceMP
-Maximum source image size in megapixels accepted for WIC image decoding.
-
+MaxSourceMP\
+Maximum source image size in megapixels accepted for ZIP image decoding.
 
 ### [Compatibility]
 
-ResolveSymlinkFallback
+ResolveSymlinkFallback\
 If enabled, VideoThumb may retry a failed decode after resolving the final target path
 through the Windows API.
 
 The default value is 0 because direct libav access already works with the tested
 local-directory-symlink → UNC/SMB configuration, and the Windows path-resolution fallback
 may block longer on an unavailable network target.
-
 
 ## Building
 
@@ -291,7 +293,6 @@ To install the locally built version:
 
 Close Total Commander before replacing the plugin DLL.
 
-
 ## Dependencies
 
 VideoThumb uses:
@@ -300,10 +301,17 @@ VideoThumb uses:
 - miniz
 - Windows Imaging Component (WIC)
 
+FFmpeg is used both for normal video decoding and as an in-memory fallback decoder
+for ZIP image entries, including HEIC / HEIF images.
+
+HEIC / HEIF decoding does not depend on Windows-installed codecs or the Microsoft
+HEIF Image Extensions package.
+
+WIC is still used for common ZIP image formats when available.
+
 FFmpeg is dynamically linked and is distributed under its own license terms.
 
 miniz is compiled statically into the plugin and remains subject to its own license.
-
 
 ## Security notes
 
@@ -321,7 +329,6 @@ The plugin includes:
 As with any software using media parsers and codecs, keeping the FFmpeg libraries up to
 date is recommended.
 
-
 ## Platform
 
 Tested on:
@@ -332,9 +339,8 @@ Tested on:
 
 The plugin itself is x64-only.
 
-
 ## Version
 
 Current version:
 
-1.4.3
+1.4.4

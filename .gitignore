@@ -30,3 +30,6 @@ Makefile
 *~
 # Local release packages
 release/
+
+# Previous source versions
+src_prev/

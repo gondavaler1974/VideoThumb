@@ -1,5 +1,10 @@
-// VideoThumb.wlx64 v1.4.2
+// VideoThumb.wlx64 v1.4.4
 // Total Commander video thumbnail WLX plugin.
+//
+// v1.4.4 adds:
+//   * FFmpeg custom-AVIO memory fallback for ZIP image entries WIC cannot decode
+//   * HEIC/HEIF ZIP frames no longer require a Windows-installed HEIF/HEVC image codec
+//   * no temp files and no additional native codec dependency for that fallback
 //
 // v1.4 adds:
 //   * general uniform-frame rejection for black, white, gray, or colored backgrounds
@@ -37,6 +42,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -63,9 +69,12 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/version.h>
 #include <libavformat/avformat.h>
+#include <libavformat/avio.h>
 #include <libavformat/version.h>
 #include <libavutil/avutil.h>
+#include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
 #include <libavutil/version.h>
 #include <libswresample/version.h>
 #include <libswscale/swscale.h>
@@ -81,15 +90,23 @@ HINSTANCE g_instance = nullptr;
 
 // ------------------------------- settings ---------------------------------
 
-std::wstring module_dir() {
-    wchar_t buf[32768]{};
-    const DWORD n = GetModuleFileNameW(g_instance, buf, static_cast<DWORD>(std::size(buf)));
-    if (!n || n >= std::size(buf)) return L".";
-    std::wstring p(buf, n);
-    const auto pos = p.find_last_of(L"\\/");
-    if (pos == std::wstring::npos) return L".";
-    p.resize(pos);
-    return p;
+const std::wstring& module_dir() {
+    // Called a handful of times total (once for Settings, once per FFmpeg
+    // DLL probed by FfmpegApi) during one-time startup, never per-thumbnail
+    // -- but the plugin's own directory can't change during the process's
+    // lifetime, so there's no reason to repeat the GetModuleFileNameW call
+    // and string parsing on every call.
+    static const std::wstring dir = [] {
+        wchar_t buf[32768]{};
+        const DWORD n = GetModuleFileNameW(g_instance, buf, static_cast<DWORD>(std::size(buf)));
+        if (!n || n >= std::size(buf)) return std::wstring(L".");
+        std::wstring p(buf, n);
+        const auto pos = p.find_last_of(L"\\/");
+        if (pos == std::wstring::npos) return std::wstring(L".");
+        p.resize(pos);
+        return p;
+    }();
+    return dir;
 }
 
 struct Settings {
@@ -132,7 +149,7 @@ struct Settings {
     bool zip_sequences = true;   // ZIP-disguised .mp4 etc. -> first image
     int zip_max_entry_mb = 64;   // decompression-bomb guard for one image entry
     int zip_max_candidates = 16; // try at most N naturally-first image entries
-    int zip_max_source_mp = 100; // WIC source pixel guard (megapixels)
+    int zip_max_source_mp = 100; // decoded source pixel guard (megapixels)
 
     // Direct libav already opens the tested local-symlink -> UNC path correctly.
     // Keep the older GetFinalPathNameByHandle retry as an opt-in compatibility path.
@@ -297,10 +314,19 @@ HBITMAP make_hbitmap(const ThumbData& t) {
     auto* dst = static_cast<uint8_t*>(bits);
     const auto* src = t.bgra.data();
     const size_t row = static_cast<size_t>(t.width) * 4;
-    for (int y = 0; y < t.height; ++y) {
-        memcpy(dst + static_cast<size_t>(y) * t.width * 4,
-               src + static_cast<size_t>(y) * t.stride,
-               row);
+    const size_t stride = static_cast<size_t>(t.stride);
+    if (stride == row) {
+        // Every ThumbData constructor in this file packs rows tightly
+        // (stride == width*4, no padding), so this is always the path taken
+        // today; one contiguous copy beats `height` separate memcpy calls.
+        // The per-row fallback stays in case that invariant ever changes.
+        memcpy(dst, src, row * static_cast<size_t>(t.height));
+    } else {
+        for (int y = 0; y < t.height; ++y) {
+            memcpy(dst + static_cast<size_t>(y) * row,
+                   src + static_cast<size_t>(y) * stride,
+                   row);
+        }
     }
     return hbmp; // ownership transfers to Total Commander
 }
@@ -416,6 +442,8 @@ struct FfmpegApi {
     bool ready = false;
 
     decltype(&::av_log_set_level) p_av_log_set_level = nullptr;
+    decltype(&::av_malloc) p_av_malloc = nullptr;
+    decltype(&::av_freep) p_av_freep = nullptr;
     decltype(&::av_frame_alloc) p_av_frame_alloc = nullptr;
     decltype(&::av_frame_free) p_av_frame_free = nullptr;
     decltype(&::av_frame_unref) p_av_frame_unref = nullptr;
@@ -439,6 +467,8 @@ struct FfmpegApi {
     decltype(&::av_read_frame) p_av_read_frame = nullptr;
     decltype(&::av_seek_frame) p_av_seek_frame = nullptr;
     decltype(&::avformat_close_input) p_avformat_close_input = nullptr;
+    decltype(&::avio_alloc_context) p_avio_alloc_context = nullptr;
+    decltype(&::avio_context_free) p_avio_context_free = nullptr;
 
     decltype(&::sws_getContext) p_sws_getContext = nullptr;
     decltype(&::sws_scale) p_sws_scale = nullptr;
@@ -497,6 +527,8 @@ struct FfmpegApi {
 
         bool ok = true;
         ok &= load_proc(h_avutil, "av_log_set_level", p_av_log_set_level);
+        ok &= load_proc(h_avutil, "av_malloc", p_av_malloc);
+        ok &= load_proc(h_avutil, "av_freep", p_av_freep);
         ok &= load_proc(h_avutil, "av_frame_alloc", p_av_frame_alloc);
         ok &= load_proc(h_avutil, "av_frame_free", p_av_frame_free);
         ok &= load_proc(h_avutil, "av_frame_unref", p_av_frame_unref);
@@ -520,6 +552,8 @@ struct FfmpegApi {
         ok &= load_proc(h_avformat, "av_read_frame", p_av_read_frame);
         ok &= load_proc(h_avformat, "av_seek_frame", p_av_seek_frame);
         ok &= load_proc(h_avformat, "avformat_close_input", p_avformat_close_input);
+        ok &= load_proc(h_avformat, "avio_alloc_context", p_avio_alloc_context);
+        ok &= load_proc(h_avformat, "avio_context_free", p_avio_context_free);
 
         ok &= load_proc(h_swscale, "sws_getContext", p_sws_getContext);
         ok &= load_proc(h_swscale, "sws_scale", p_sws_scale);
@@ -542,13 +576,66 @@ struct InterruptState {
     ULONGLONG deadline = 0;
 };
 
+// Read-only in-memory source for FFmpeg custom AVIO. This is used only as a
+// fallback for ZIP image entries that the Windows WIC path cannot decode
+// (notably HEIC/HEIF when no Windows image codec is installed).
+struct MemoryAvioState {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    size_t pos = 0;
+};
+
+int memory_avio_read(void* opaque, uint8_t* buf, int buf_size) noexcept {
+    auto* s = static_cast<MemoryAvioState*>(opaque);
+    if (!s || !buf || buf_size <= 0) return AVERROR(EINVAL);
+    if (s->pos >= s->size) return AVERROR_EOF;
+
+    const size_t remaining = s->size - s->pos;
+    const size_t n = std::min(remaining, static_cast<size_t>(buf_size));
+    memcpy(buf, s->data + s->pos, n);
+    s->pos += n;
+    return static_cast<int>(n);
+}
+
+int64_t memory_avio_seek(void* opaque, int64_t offset, int whence) noexcept {
+    auto* s = static_cast<MemoryAvioState*>(opaque);
+    if (!s || s->size > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+        return AVERROR(EINVAL);
+
+    const int base_whence = whence & ~AVSEEK_FORCE;
+    if (base_whence == AVSEEK_SIZE) return static_cast<int64_t>(s->size);
+
+    int64_t base = 0;
+    switch (base_whence) {
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR:
+            if (s->pos > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+                return AVERROR(EINVAL);
+            base = static_cast<int64_t>(s->pos);
+            break;
+        case SEEK_END: base = static_cast<int64_t>(s->size); break;
+        default: return AVERROR(EINVAL);
+    }
+
+    if ((offset > 0 && base > std::numeric_limits<int64_t>::max() - offset) ||
+        (offset < 0 && base < std::numeric_limits<int64_t>::min() - offset))
+        return AVERROR(EINVAL);
+
+    const int64_t target = base + offset;
+    if (target < 0 || static_cast<uint64_t>(target) > static_cast<uint64_t>(s->size))
+        return AVERROR(EINVAL);
+
+    s->pos = static_cast<size_t>(target);
+    return target;
+}
+
 int ff_interrupt_cb(void* opaque) {
     const auto* s = static_cast<const InterruptState*>(opaque);
     return s && GetTickCount64() >= s->deadline;
 }
 
-bool receive_one_frame(AVCodecContext* dec, AVFrame* frame) {
-    return ff().p_avcodec_receive_frame(dec, frame) == 0;
+bool receive_one_frame(FfmpegApi& api, AVCodecContext* dec, AVFrame* frame) {
+    return api.p_avcodec_receive_frame(dec, frame) == 0;
 }
 
 bool decode_frame_from_current(AVFormatContext* fmt,
@@ -557,41 +644,48 @@ bool decode_frame_from_current(AVFormatContext* fmt,
                                AVPacket* pkt,
                                AVFrame* frame,
                                int packet_limit) {
+    // Fetched once instead of once per packet (up to `packet_limit`, 5000 by
+    // default): every ff() call repeats a function-local-static guard check
+    // and a fresh member-pointer load before the indirect call. Hoisting it
+    // turns that into one guard check plus register-resident reads for the
+    // rest of the loop.
+    FfmpegApi& api = ff();
     int packets = 0;
-    while (packets++ < packet_limit && ff().p_av_read_frame(fmt, pkt) >= 0) {
+    while (packets++ < packet_limit && api.p_av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index != video_index) {
-            ff().p_av_packet_unref(pkt);
+            api.p_av_packet_unref(pkt);
             continue;
         }
 
-        int s = ff().p_avcodec_send_packet(dec, pkt);
+        int s = api.p_avcodec_send_packet(dec, pkt);
         if (s == AVERROR(EAGAIN)) {
-            if (receive_one_frame(dec, frame)) {
-                ff().p_av_packet_unref(pkt);
+            if (receive_one_frame(api, dec, frame)) {
+                api.p_av_packet_unref(pkt);
                 return true;
             }
             // Retry the same packet after draining; EAGAIN means it was not consumed.
-            s = ff().p_avcodec_send_packet(dec, pkt);
+            s = api.p_avcodec_send_packet(dec, pkt);
         }
-        ff().p_av_packet_unref(pkt);
+        api.p_av_packet_unref(pkt);
         if (s < 0) continue;
 
-        for (;;) {
-            const int r = ff().p_avcodec_receive_frame(dec, frame);
-            if (r == 0) return true;
-            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
-            break;
-        }
+        // This used to be wrapped in a `for (;;) { ... }` loop, but both
+        // branches of the check below ended in `break` -- so it only ever
+        // ran one iteration. Simplified to straight-line code with
+        // identical behavior.
+        const int r = api.p_avcodec_receive_frame(dec, frame);
+        if (r == 0) return true;
     }
 
     // Flush delayed frames at EOF.
-    ff().p_avcodec_send_packet(dec, nullptr);
-    return receive_one_frame(dec, frame);
+    api.p_avcodec_send_packet(dec, nullptr);
+    return receive_one_frame(api, dec, frame);
 }
 
 std::shared_ptr<ThumbData> scale_frame_to_thumb(const AVFrame* frame, int max_w, int max_h) {
     if (!frame || frame->width <= 0 || frame->height <= 0 || frame->format < 0 || max_w <= 0 || max_h <= 0) return {};
 
+    FfmpegApi& api = ff();
     const double sx = static_cast<double>(max_w) / frame->width;
     const double sy = static_cast<double>(max_h) / frame->height;
     const double scale = std::min(sx, sy);
@@ -604,7 +698,7 @@ std::shared_ptr<ThumbData> scale_frame_to_thumb(const AVFrame* frame, int max_w,
     out->stride = out_w * 4;
     out->bgra.resize(static_cast<size_t>(out->stride) * out_h);
 
-    SwsContext* sws = ff().p_sws_getContext(frame->width,
+    SwsContext* sws = api.p_sws_getContext(frame->width,
                                      frame->height,
                                      static_cast<AVPixelFormat>(frame->format),
                                      out_w,
@@ -618,14 +712,14 @@ std::shared_ptr<ThumbData> scale_frame_to_thumb(const AVFrame* frame, int max_w,
 
     uint8_t* dst_data[4] = { out->bgra.data(), nullptr, nullptr, nullptr };
     int dst_linesize[4] = { out->stride, 0, 0, 0 };
-    const int rows = ff().p_sws_scale(sws,
+    const int rows = api.p_sws_scale(sws,
                                frame->data,
                                frame->linesize,
                                0,
                                frame->height,
                                dst_data,
                                dst_linesize);
-    ff().p_sws_freeContext(sws);
+    api.p_sws_freeContext(sws);
     if (rows <= 0) return {};
     return out;
 }
@@ -653,20 +747,38 @@ FrameStats frame_stats(const ThumbData& t, const Settings& cfg) noexcept {
     FrameStats out{};
     if (t.width <= 0 || t.height <= 0 || t.stride < t.width * 4 || t.bgra.empty()) return out;
 
+    constexpr int step = 4;
+    constexpr int bright_threshold = 180;
+    const int width = t.width;
+    const int height = t.height;
+    const int stride = t.stride;
+    constexpr size_t max_sampled_cols = (8192u + step - 1u) / step;
+    const size_t sampled_cols = (static_cast<size_t>(width) + step - 1) / step;
+    if (sampled_cols > max_sampled_cols) return out;
+
     uint64_t dark = 0, mid = 0, bright = 0, total = 0;
     uint64_t luma_sum = 0, luma_sq_sum = 0;
     uint64_t b_sum = 0, g_sum = 0, r_sum = 0;
     uint64_t b_sq_sum = 0, g_sq_sum = 0, r_sq_sum = 0;
     uint64_t edge_count = 0, gradient_count = 0, gradient_sum = 0;
-    std::array<uint32_t, 512> color_bins{}; // 3 bits/channel: near colors share a bin
-    uint32_t dominant_count = 0;
+    std::array<uint32_t, 512> color_bins{};
 
-    constexpr int step = 4;
-    constexpr int bright_threshold = 180;
+    // Each sampled pixel's luma is computed exactly once. A single fixed
+    // row buffer stores the previous sampled row; while scanning the next
+    // row, each slot is compared vertically and then overwritten in place
+    // with the current luma. Horizontal gradients use one scalar holding the
+    // previous sampled pixel in the same row. This avoids heap allocation
+    // inside this noexcept function while preserving the same statistics.
+    std::array<uint8_t, max_sampled_cols> prev_luma{};
+    bool have_prev = false;
 
-    for (int y = 0; y < t.height; y += step) {
-        const uint8_t* row = t.bgra.data() + static_cast<size_t>(y) * t.stride;
-        for (int x = 0; x < t.width; x += step) {
+    for (int y = 0; y < height; y += step) {
+        const uint8_t* row = t.bgra.data() + static_cast<size_t>(y) * stride;
+        size_t col = 0;
+        int left_luma = 0;
+        bool have_left = false;
+
+        for (int x = 0; x < width; x += step, ++col) {
             const uint8_t* p = row + static_cast<size_t>(x) * 4;
             const int b = p[0], g = p[1], r = p[2];
             const int luma = pixel_luma(p);
@@ -685,27 +797,30 @@ FrameStats frame_stats(const ThumbData& t, const Settings& cfg) noexcept {
             const unsigned bin = (static_cast<unsigned>(r) >> 5U) << 6U |
                                  (static_cast<unsigned>(g) >> 5U) << 3U |
                                  (static_cast<unsigned>(b) >> 5U);
-            const uint32_t count = ++color_bins[bin];
-            if (count > dominant_count) dominant_count = count;
-
-            if (x + step < t.width) {
-                const int other = pixel_luma(row + static_cast<size_t>(x + step) * 4);
-                const unsigned diff = static_cast<unsigned>(std::abs(luma - other));
-                gradient_sum += diff; ++gradient_count;
-                if (diff >= static_cast<unsigned>(cfg.edge_threshold)) ++edge_count;
-            }
-            if (y + step < t.height) {
-                const uint8_t* row2 = t.bgra.data() + static_cast<size_t>(y + step) * t.stride;
-                const int other = pixel_luma(row2 + static_cast<size_t>(x) * 4);
-                const unsigned diff = static_cast<unsigned>(std::abs(luma - other));
-                gradient_sum += diff; ++gradient_count;
-                if (diff >= static_cast<unsigned>(cfg.edge_threshold)) ++edge_count;
-            }
+            ++color_bins[bin];
             ++total;
+
+            if (have_left) {
+                const unsigned diff = static_cast<unsigned>(std::abs(luma - left_luma));
+                gradient_sum += diff; ++gradient_count;
+                if (diff >= static_cast<unsigned>(cfg.edge_threshold)) ++edge_count;
+            }
+            left_luma = luma;
+            have_left = true;
+
+            if (have_prev) {
+                const unsigned diff = static_cast<unsigned>(std::abs(luma - static_cast<int>(prev_luma[col])));
+                gradient_sum += diff; ++gradient_count;
+                if (diff >= static_cast<unsigned>(cfg.edge_threshold)) ++edge_count;
+            }
+            prev_luma[col] = static_cast<uint8_t>(luma);
         }
+
+        have_prev = true;
     }
 
     if (!total) return out;
+    const uint32_t dominant_count = *std::max_element(color_bins.begin(), color_bins.end());
     const double n = static_cast<double>(total);
     const double inv = 1.0 / n;
     out.dark_ratio = static_cast<double>(dark) * inv;
@@ -807,6 +922,17 @@ bool is_image_entry_name(std::string_view name) noexcept {
     return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" ||
            ext == ".gif" || ext == ".tif" || ext == ".tiff" || ext == ".webp" ||
            ext == ".heic" || ext == ".heif";
+}
+
+bool is_heif_entry_name(std::string_view name) noexcept {
+    const size_t slash = name.find_last_of("/\\");
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string_view::npos || (slash != std::string_view::npos && dot < slash)) return false;
+    std::string ext(name.substr(dot));
+    for (char& c : ext) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return ext == ".heic" || ext == ".heif";
 }
 
 int natural_compare_ascii_ci(std::string_view a, std::string_view b) noexcept {
@@ -947,6 +1073,119 @@ std::shared_ptr<ThumbData> decode_image_wic(const std::vector<uint8_t>& bytes, i
     return out;
 }
 
+// Decode one still image directly from an in-memory ZIP entry with FFmpeg.
+// This path uses the bundled FFmpeg directly: no temporary file and no
+// Windows-installed HEIF/HEVC image extension is required.
+std::shared_ptr<ThumbData> decode_image_ffmpeg_memory(const std::vector<uint8_t>& bytes,
+                                                      int max_w, int max_h) {
+    if (bytes.empty() || max_w <= 0 || max_h <= 0 ||
+        bytes.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) return {};
+
+    FfmpegApi& api = ff();
+    if (!api.ready) return {};
+
+    constexpr int avio_buffer_size = 32 * 1024;
+    uint8_t* avio_buffer = static_cast<uint8_t*>(api.p_av_malloc(avio_buffer_size));
+    if (!avio_buffer) return {};
+
+    MemoryAvioState mem_source{bytes.data(), bytes.size(), 0};
+    AVIOContext* avio = api.p_avio_alloc_context(avio_buffer, avio_buffer_size, 0,
+                                                 &mem_source, memory_avio_read, nullptr,
+                                                 memory_avio_seek);
+    if (!avio) {
+        api.p_av_freep(&avio_buffer);
+        return {};
+    }
+
+    InterruptState interrupt{GetTickCount64() + static_cast<ULONGLONG>(settings().timeout_ms)};
+    AVFormatContext* fmt = api.p_avformat_alloc_context();
+    AVCodecContext* dec = nullptr;
+    AVPacket* pkt = nullptr;
+    AVFrame* frame = nullptr;
+    const AVCodec* decoder = nullptr;
+    std::shared_ptr<ThumbData> result;
+
+    if (!fmt) goto done;
+    fmt->pb = avio;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    fmt->interrupt_callback.callback = ff_interrupt_cb;
+    fmt->interrupt_callback.opaque = &interrupt;
+
+    if (api.p_avformat_open_input(&fmt, nullptr, nullptr, nullptr) < 0 || !fmt) goto done;
+    if (api.p_avformat_find_stream_info(fmt, nullptr) < 0) goto done;
+
+    {
+        const int vi = api.p_av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+        if (vi < 0 || !decoder || vi >= static_cast<int>(fmt->nb_streams)) goto done;
+
+        AVCodecParameters* codecpar = fmt->streams[vi]->codecpar;
+        if (!codecpar) goto done;
+
+        // Reject obviously oversized sources as soon as the container exposes
+        // dimensions, then check the decoded frame again below as a backstop.
+        if (codecpar->width > 0 && codecpar->height > 0) {
+            const uint64_t source_pixels = static_cast<uint64_t>(codecpar->width) *
+                                           static_cast<uint64_t>(codecpar->height);
+            const uint64_t max_pixels = static_cast<uint64_t>(settings().zip_max_source_mp) *
+                                        1000000ULL;
+            if (source_pixels > max_pixels) goto done;
+        }
+
+        dec = api.p_avcodec_alloc_context3(decoder);
+        if (!dec) goto done;
+        if (api.p_avcodec_parameters_to_context(dec, codecpar) < 0) goto done;
+        if (settings().decoder_threads > 0) dec->thread_count = settings().decoder_threads;
+        if (api.p_avcodec_open2(dec, decoder, nullptr) < 0) goto done;
+
+        pkt = api.p_av_packet_alloc();
+        frame = api.p_av_frame_alloc();
+        if (!pkt || !frame) goto done;
+
+        if (!decode_frame_from_current(fmt, dec, vi, pkt, frame, settings().packet_limit)) goto done;
+        if (frame->width <= 0 || frame->height <= 0) goto done;
+
+        const uint64_t decoded_pixels = static_cast<uint64_t>(frame->width) *
+                                        static_cast<uint64_t>(frame->height);
+        const uint64_t max_pixels = static_cast<uint64_t>(settings().zip_max_source_mp) *
+                                    1000000ULL;
+        if (decoded_pixels > max_pixels) goto done;
+
+        try {
+            result = scale_frame_to_thumb(frame, max_w, max_h);
+        } catch (...) {
+            result.reset();
+        }
+    }
+
+done:
+    if (frame) api.p_av_frame_free(&frame);
+    if (pkt) api.p_av_packet_free(&pkt);
+    if (dec) api.p_avcodec_free_context(&dec);
+    if (fmt) api.p_avformat_close_input(&fmt);
+
+    // avformat may replace AVIOContext::buffer internally. Free the buffer
+    // actually owned by the AVIO context, then free the context itself.
+    if (avio) {
+        if (avio->buffer) api.p_av_freep(&avio->buffer);
+        api.p_avio_context_free(&avio);
+    }
+    return result;
+}
+
+std::shared_ptr<ThumbData> decode_image_memory(const std::vector<uint8_t>& bytes,
+                                               std::string_view entry_name,
+                                               int max_w, int max_h) {
+    // HEIC/HEIF deliberately bypasses WIC so support never depends on a
+    // Windows-installed HEIF/HEVC image extension. Use the bundled FFmpeg.
+    if (is_heif_entry_name(entry_name))
+        return decode_image_ffmpeg_memory(bytes, max_w, max_h);
+
+    // Preserve the existing fast/native WIC path for ordinary image formats,
+    // but fall back to the bundled FFmpeg if WIC cannot decode the entry.
+    if (auto t = decode_image_wic(bytes, max_w, max_h)) return t;
+    return decode_image_ffmpeg_memory(bytes, max_w, max_h);
+}
+
 std::shared_ptr<ThumbData> decode_zip_first_image(const wchar_t* file, int max_w, int max_h) {
     if (!settings().zip_sequences || !file || !*file) return {};
 
@@ -977,6 +1216,14 @@ std::shared_ptr<ThumbData> decode_zip_first_image(const wchar_t* file, int max_w
         const mz_uint count = mz_zip_reader_get_num_files(&zip);
         const uint64_t max_entry = static_cast<uint64_t>(settings().zip_max_entry_mb) * 1024ULL * 1024ULL;
         const size_t keep = static_cast<size_t>(settings().zip_max_candidates);
+        candidates.reserve(keep);
+
+        // Strict total order: natural filename order first, then archive index
+        // as a deterministic tie-breaker for duplicate/equivalent names.
+        const auto candidate_before = [](const ZipCandidate& a, const ZipCandidate& b) noexcept {
+            const int cmp = natural_compare_ascii_ci(a.name, b.name);
+            return cmp != 0 ? cmp < 0 : a.index < b.index;
+        };
 
         for (mz_uint i = 0; i < count; ++i) {
             if (mz_zip_reader_is_file_a_directory(&zip, i) || mz_zip_reader_is_file_encrypted(&zip, i)) continue;
@@ -984,19 +1231,29 @@ std::shared_ptr<ThumbData> decode_zip_first_image(const wchar_t* file, int max_w
             if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
             if (st.m_uncomp_size == 0 || st.m_uncomp_size > max_entry || !is_image_entry_name(st.m_filename)) continue;
 
-            ZipCandidate c{i, st.m_filename, st.m_uncomp_size};
-            candidates.push_back(std::move(c));
-            std::sort(candidates.begin(), candidates.end(), [](const ZipCandidate& a, const ZipCandidate& b) {
-                return natural_compare_ascii_ci(a.name, b.name) < 0;
-            });
-            if (candidates.size() > keep) candidates.resize(keep);
+            ZipCandidate candidate{i, st.m_filename, st.m_uncomp_size};
+            if (candidates.size() < keep) {
+                candidates.push_back(std::move(candidate));
+                std::push_heap(candidates.begin(), candidates.end(), candidate_before);
+            } else if (candidate_before(candidate, candidates.front())) {
+                // The heap front is the worst (latest) candidate currently
+                // kept. Replace it only when the new entry belongs in top-K.
+                std::pop_heap(candidates.begin(), candidates.end(), candidate_before);
+                candidates.back() = std::move(candidate);
+                std::push_heap(candidates.begin(), candidates.end(), candidate_before);
+            }
         }
+
+        // Convert the bounded max-heap to the same ascending natural order
+        // used when attempting image decode. Memory stays O(MaxCandidates)
+        // even for archives containing huge numbers of image entries.
+        std::sort_heap(candidates.begin(), candidates.end(), candidate_before);
 
         for (const auto& c : candidates) {
             if (c.uncompressed_size > static_cast<mz_uint64>(std::numeric_limits<size_t>::max())) continue;
             std::vector<uint8_t> image(static_cast<size_t>(c.uncompressed_size));
             if (!mz_zip_reader_extract_to_mem(&zip, c.index, image.data(), image.size(), 0)) continue;
-            result = decode_image_wic(image, max_w, max_h);
+            result = decode_image_memory(image, c.name, max_w, max_h);
             if (result) break;
         }
     } catch (...) {
@@ -1012,10 +1269,14 @@ std::shared_ptr<ThumbData> decode_zip_first_image(const wchar_t* file, int max_w
 
 std::shared_ptr<ThumbData> decode_with_libav_utf8(const std::string& input, int max_w, int max_h) {
     if (input.empty()) return {};
-    if (!ff().ready) return {};
+    // Fetched once for the whole function (including the try_target lambda
+    // below, which captures it by reference) instead of once per ff() call
+    // scattered across setup, the per-target retry loop, and teardown.
+    FfmpegApi& api = ff();
+    if (!api.ready) return {};
 
     InterruptState interrupt{GetTickCount64() + static_cast<ULONGLONG>(settings().timeout_ms)};
-    AVFormatContext* fmt = ff().p_avformat_alloc_context();
+    AVFormatContext* fmt = api.p_avformat_alloc_context();
     AVCodecContext* dec = nullptr;
     AVPacket* pkt = nullptr;
     AVFrame* frame = nullptr;
@@ -1027,21 +1288,21 @@ std::shared_ptr<ThumbData> decode_with_libav_utf8(const std::string& input, int 
     fmt->interrupt_callback.callback = ff_interrupt_cb;
     fmt->interrupt_callback.opaque = &interrupt;
 
-    if (ff().p_avformat_open_input(&fmt, input.c_str(), nullptr, nullptr) < 0 || !fmt) goto done;
-    if (ff().p_avformat_find_stream_info(fmt, nullptr) < 0) goto done;
+    if (api.p_avformat_open_input(&fmt, input.c_str(), nullptr, nullptr) < 0 || !fmt) goto done;
+    if (api.p_avformat_find_stream_info(fmt, nullptr) < 0) goto done;
 
-    vi = ff().p_av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+    vi = api.p_av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if (vi < 0 || !decoder || vi >= static_cast<int>(fmt->nb_streams)) goto done;
 
-    dec = ff().p_avcodec_alloc_context3(decoder);
+    dec = api.p_avcodec_alloc_context3(decoder);
     if (!dec) goto done;
-    if (ff().p_avcodec_parameters_to_context(dec, fmt->streams[vi]->codecpar) < 0) goto done;
+    if (api.p_avcodec_parameters_to_context(dec, fmt->streams[vi]->codecpar) < 0) goto done;
 
     if (settings().decoder_threads > 0) dec->thread_count = settings().decoder_threads;
-    if (ff().p_avcodec_open2(dec, decoder, nullptr) < 0) goto done;
+    if (api.p_avcodec_open2(dec, decoder, nullptr) < 0) goto done;
 
-    pkt = ff().p_av_packet_alloc();
-    frame = ff().p_av_frame_alloc();
+    pkt = api.p_av_packet_alloc();
+    frame = api.p_av_frame_alloc();
     if (!pkt || !frame) goto done;
 
     {
@@ -1080,10 +1341,10 @@ std::shared_ptr<ThumbData> decode_with_libav_utf8(const std::string& input, int 
         auto try_target = [&](int64_t target_us) -> bool {
             if (GetTickCount64() >= interrupt.deadline) return false;
 
-            ff().p_av_frame_unref(frame);
-            ff().p_avcodec_flush_buffers(dec);
+            api.p_av_frame_unref(frame);
+            api.p_avcodec_flush_buffers(dec);
             if (target_us == 0) zero_tried = true;
-            if (ff().p_av_seek_frame(fmt, -1, target_us, AVSEEK_FLAG_BACKWARD) < 0) return false;
+            if (api.p_av_seek_frame(fmt, -1, target_us, AVSEEK_FLAG_BACKWARD) < 0) return false;
             if (!decode_frame_from_current(fmt, dec, vi, pkt, frame, cfg.packet_limit)) return false;
 
             std::shared_ptr<ThumbData> thumb;
@@ -1126,10 +1387,10 @@ std::shared_ptr<ThumbData> decode_with_libav_utf8(const std::string& input, int 
     }
 
 done:
-    if (frame) ff().p_av_frame_free(&frame);
-    if (pkt) ff().p_av_packet_free(&pkt);
-    if (dec) ff().p_avcodec_free_context(&dec);
-    if (fmt) ff().p_avformat_close_input(&fmt);
+    if (frame) api.p_av_frame_free(&frame);
+    if (pkt) api.p_av_packet_free(&pkt);
+    if (dec) api.p_avcodec_free_context(&dec);
+    if (fmt) api.p_avformat_close_input(&fmt);
     return result;
 }
 

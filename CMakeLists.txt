@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(VideoThumb VERSION 1.4.3 LANGUAGES C CXX)
+project(VideoThumb VERSION 1.4.4 LANGUAGES C CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "VideoThumb is a Windows/Total Commander WLX plugin.")
